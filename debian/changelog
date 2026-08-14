@@ -1,3 +1,14 @@
+mstpd (0.2.0+avari2) noble; urgency=medium
+
+  * debian: install and enable the mstpd systemd service. Upstream ships
+    mstpd.service only when configure is given --with-systemdunitdir, which the
+    debian/sid packaging never passed, so no daemon was installed - leaving
+    mstpctl and the Topology-A RSTP dispatcher hook with nothing to talk to.
+    Force the unit dir and let dh_installsystemd (compat 13) enable + start it.
+  * debian: bump to debhelper-compat 13; keep dh_missing informational.
+
+ -- Steve Williams <swilliams@avariwireless.com>  Fri, 14 Aug 2026 07:56:33 +0000
+
 mstpd (0.2.0+avari1) noble; urgency=medium
 
   * Avari: package mstpd for Ubuntu noble (dali-controller dependency).

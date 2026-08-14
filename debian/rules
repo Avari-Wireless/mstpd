@@ -15,14 +15,25 @@ export DEB_BUILD_MAINT_OPTIONS=hardening=+all
 
 
 %:
-	dh $@ --with autoreconf
+	dh $@
 
-# Use /lib/mstpctl-utils/ instead of /lib/x86_64-linux-gnu/mstpctl-utils/
+# Use /lib/mstpctl-utils/ instead of /lib/x86_64-linux-gnu/mstpctl-utils/, AND
+# install the systemd unit. Upstream only installs mstpd.service when
+# --with-systemdunitdir is set; the debian/sid packaging never passed it, so the
+# unit was silently dropped - leaving no daemon for mstpctl / the Topology-A RSTP
+# dispatcher hook to talk to. Forcing the dir installs it, and dh (compat 13)
+# enables + starts it via dh_installsystemd.
 override_dh_auto_configure:
 	dh_auto_configure -- --libexecdir=/lib \
-		--with-bashcompletiondir=/usr/share/bash-completion/completions
+		--with-bashcompletiondir=/usr/share/bash-completion/completions \
+		--with-systemdunitdir=/usr/lib/systemd/system
 
 # Skip the upstream test suite: it needs cmocka (libcmocka-dev) and only
 # validates upstream code we vendor unchanged - not the packaging. Avari CI
 # packages mstpd, it does not re-test it. (Empty override = do nothing.)
 override_dh_auto_test:
+
+# compat 13 upgrades dh_missing to fail-missing; keep it informational so a stray
+# upstream artefact we don't package can't fail CI.
+override_dh_missing:
+	dh_missing --list-missing
