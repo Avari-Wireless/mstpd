@@ -1,19 +1,105 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
+# Avari CI for mstpd (vendored MSTP/RSTP daemon).
+#
+# mstpd is NOT in the Ubuntu noble archive, but dali-controller depends on it
+# (RSTP on Topology-A DMCs). So Avari builds it from this fork and serves the
+# .deb from the Avari apt repo, keeping mstpd's own upstream version (0.2.0+avari1)
+# rather than the Avari 8.0.N release scheme - it is third-party software, not an
+# Avari component. Once it lands in the shared dev pool, every component release
+# snapshot carries it (same as the fpga-* debs).
+#
+# Build: on the noble debbuild container, straight dpkg-buildpackage from the
+#        debian/ packaging carried on this branch (from debian/sid).
+# Release (f-ubuntu only): add to avari-debs-dev and republish the v8-integration
+#        channel, under the shared aptly flock (re-entrant scripts, no re-label).
+#
+# Prerequisites (one-time, in the AZDO project this pipeline runs in):
+#   * Pipeline permitted to use the 'avari-repo-deploy-key' Secure File.
+#   * Agent pool 'Avari-Agents' reachable, with :22 to the repo VM.
 
 trigger:
-- master
+  branches:
+    include:
+    - f-ubuntu
+    - master
+
+pr: none
 
 pool:
-  vmImage: ubuntu-latest
+  name: Avari-Agents
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
+variables:
+  ubuntu_release: '24.04'
+  repoHost: '20.116.20.203'
+  repoUser: 'devops'
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+stages:
+- stage: Build
+  displayName: Build mstpd .deb
+  jobs:
+  - job: Build
+    displayName: dpkg-buildpackage
+    container:
+      image: 'avari.azurecr.io/devops/ubuntu-debbuild:$(ubuntu_release)'
+      endpoint: 'acr-avari-devops'
+    workspace:
+      clean: all
+    steps:
+    - checkout: self
+      clean: true
+    - script: |
+        set -euo pipefail
+        # Build deps (debhelper, dh-autoreconf, autoconf/automake/libtool, dpkg-dev,
+        # build-essential, pkg-config) are baked into the ubuntu-debbuild image.
+        # Native package; builds a binary .deb into the parent directory.
+        dpkg-buildpackage -us -uc -b
+        mkdir -p "$(Build.ArtifactStagingDirectory)"
+        cp "$(dirname "$PWD")"/mstpd_*_amd64.deb "$(Build.ArtifactStagingDirectory)/"
+        echo "built:"; ls -l "$(Build.ArtifactStagingDirectory)"
+      workingDirectory: $(Build.SourcesDirectory)
+      displayName: Build mstpd .deb
+    - publish: '$(Build.ArtifactStagingDirectory)'
+      artifact: debs
+      displayName: Publish .deb artifact
+
+- stage: Release
+  displayName: Release mstpd to aptly (dev / v8-integration)
+  dependsOn: Build
+  # Only the integration branch publishes; master is build-only. Gate on the
+  # STAGE, never on the DownloadSecureFile task (it runs pre-job, before any
+  # in-stage variable exists).
+  condition: and(succeeded(), eq(variables['Build.SourceBranchName'], 'f-ubuntu'))
+  jobs:
+  - job: Release
+    displayName: aptly add + promote
+    workspace:
+      clean: all
+    steps:
+    - checkout: none
+    - download: current
+      artifact: debs
+    - task: DownloadSecureFile@1
+      name: deployKey
+      displayName: 'Get repo deploy SSH key'
+      inputs:
+        secureFile: 'avari-repo-deploy-key'
+    - script: |
+        set -euo pipefail
+        KEY="$(deployKey.secureFilePath)"; chmod 600 "$KEY"
+        SSHOPTS="-i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 -o BatchMode=yes"
+        HOST="$(repoUser)@$(repoHost)"
+        DEB="$(find "$(Pipeline.Workspace)/debs" -name 'mstpd_*_amd64.deb' | head -1)"
+        [ -n "$DEB" ] || { echo "##[error]no mstpd .deb in artifact"; exit 1; }
+        TAG="mstpd-$(Build.BuildNumber)"; TAG="${TAG//[^A-Za-z0-9._-]/_}"
+        echo "releasing $(basename "$DEB") as snapshot dev-rel-$TAG -> v8-integration"
+        ssh $SSHOPTS "$HOST" "rm -rf /tmp/rel-$TAG && mkdir -p /tmp/rel-$TAG"
+        scp $SSHOPTS "$DEB" "$HOST:/tmp/rel-$TAG/"
+        # One atomic critical section: add to the dev pool + republish the channel
+        # under the shared aptly lock. Keep mstpd's native version (no re-label).
+        # The avari-repo-* scripts are re-entrant under AVARI_APTLY_LOCK_HELD, so
+        # they run under this outer lock without deadlocking.
+        ssh $SSHOPTS "$HOST" "sudo flock -w 600 /var/lock/avari-aptly.lock env AVARI_APTLY_LOCK_HELD=1 bash -s -- '$TAG'" <<'REMOTE'
+        avari-repo-add dev "$1" /tmp/rel-"$1"/*.deb && avari-repo-promote v8-integration "dev-rel-$1"
+        REMOTE
+        ssh $SSHOPTS "$HOST" "rm -rf /tmp/rel-$TAG"
+        echo "released mstpd to avari-debs-dev; v8-integration republished."
+      displayName: aptly add + promote (dev / v8-integration)
