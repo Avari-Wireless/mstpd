@@ -21,3 +21,8 @@ export DEB_BUILD_MAINT_OPTIONS=hardening=+all
 override_dh_auto_configure:
 	dh_auto_configure -- --libexecdir=/lib \
 		--with-bashcompletiondir=/usr/share/bash-completion/completions
+
+# Skip the upstream test suite: it needs cmocka (libcmocka-dev) and only
+# validates upstream code we vendor unchanged - not the packaging. Avari CI
+# packages mstpd, it does not re-test it. (Empty override = do nothing.)
+override_dh_auto_test:
