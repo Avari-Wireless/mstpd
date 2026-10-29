@@ -11,6 +11,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <stdio.h>
+#include <fnmatch.h>
+#include <stddef.h>
 #include <linux/param.h>
 #include <netinet/in.h>
 #include <linux/if_bridge.h>
@@ -30,6 +33,134 @@
 #endif
 
 static LIST_HEAD(bridges);
+
+/* Per-port configuration applied when a port is created - that is, every time
+ * an interface joins a bridge, since a port that leaves is deleted and one that
+ * (re)joins starts from defaults. Without this, settings made with mstpctl after
+ * the join are lost on every rejoin (a recreated tunnel port, a networkd
+ * reconfigure), and a script making them races the enslavement at boot.
+ *
+ * One line per rule: <bridge> <port> <setting>=<value>... with shell-style
+ * patterns for the bridge and port, '#' comments, and every matching line
+ * applied in file order. Settings (CIST port configuration, as mstpctl):
+ *   adminedge autoedge bpduguard bpdufilter restrrole restrtcn network dontxmt
+ *     = yes|no
+ *   p2p = yes|no|auto
+ * A missing file means nothing to apply. A bad setting is logged and skipped;
+ * the rest of the line still applies.
+ */
+#ifndef MSTPD_PORT_CONFIG
+#define MSTPD_PORT_CONFIG "/etc/mstpd-ports.conf"
+#endif
+
+static int port_cfg_bool(const char *val, bool *out)
+{
+    if(!strcmp(val, "yes"))
+        *out = true;
+    else if(!strcmp(val, "no"))
+        *out = false;
+    else
+        return -1;
+    return 0;
+}
+
+/* Fold one "setting=value" into cfg; -1 if the setting or value is unknown */
+static int port_cfg_parse(char *tok, CIST_PortConfig *cfg)
+{
+    static const struct
+    {
+        const char *name;
+        size_t val, set;
+    } flags[] =
+    {
+#define F(n, m) { n, offsetof(CIST_PortConfig, m), \
+                  offsetof(CIST_PortConfig, set_##m) }
+        F("adminedge", admin_edge_port),
+        F("autoedge", auto_edge_port),
+        F("bpduguard", bpdu_guard_port),
+        F("bpdufilter", bpdu_filter_port),
+        F("restrrole", restricted_role),
+        F("restrtcn", restricted_tcn),
+        F("network", network_port),
+        F("dontxmt", dont_txmt),
+#undef F
+    };
+    char *val = strchr(tok, '=');
+    unsigned i;
+
+    if(!val)
+        return -1;
+    *val++ = '\0';
+    if(!strcmp(tok, "p2p"))
+    {
+        if(!strcmp(val, "yes"))
+            cfg->admin_p2p = p2pForceTrue;
+        else if(!strcmp(val, "no"))
+            cfg->admin_p2p = p2pForceFalse;
+        else if(!strcmp(val, "auto"))
+            cfg->admin_p2p = p2pAuto;
+        else
+            return -1;
+        cfg->set_admin_p2p = true;
+        return 0;
+    }
+    for(i = 0; i < sizeof(flags) / sizeof(flags[0]); ++i)
+    {
+        if(strcmp(tok, flags[i].name))
+            continue;
+        if(port_cfg_bool(val, (bool *)((char *)cfg + flags[i].val)))
+            return -1;
+        *(bool *)((char *)cfg + flags[i].set) = true;
+        return 0;
+    }
+    return -1;
+}
+
+static void apply_port_config(port_t *prt)
+{
+    FILE *f = fopen(MSTPD_PORT_CONFIG, "r");
+    char line[256];
+    int lineno = 0;
+
+    if(!f)
+        return;
+    while(fgets(line, sizeof(line), f))
+    {
+        CIST_PortConfig cfg;
+        char *save, *br, *port, *tok;
+        bool any = false;
+
+        ++lineno;
+        line[strcspn(line, "#\n")] = '\0';
+        if(!(br = strtok_r(line, " \t", &save))
+           || !(port = strtok_r(NULL, " \t", &save)))
+            continue;
+        if(fnmatch(br, prt->bridge->sysdeps.name, 0)
+           || fnmatch(port, prt->sysdeps.name, 0))
+            continue;
+        memset(&cfg, 0, sizeof(cfg));
+        while((tok = strtok_r(NULL, " \t", &save)))
+        {
+            char setting[64];
+
+            snprintf(setting, sizeof(setting), "%s", tok);
+            if(port_cfg_parse(tok, &cfg))
+                ERROR("%s:%d: bad setting '%s' - skipped",
+                      MSTPD_PORT_CONFIG, lineno, setting);
+            else
+                any = true;
+        }
+        if(!any)
+            continue;
+        if(MSTP_IN_set_cist_port_config(prt, &cfg))
+            ERROR("%s:%d: could not apply to %s on %s", MSTPD_PORT_CONFIG,
+                  lineno, prt->sysdeps.name, prt->bridge->sysdeps.name);
+        else
+            INFO("Port %s on %s: applied %s line %d", prt->sysdeps.name,
+                 prt->bridge->sysdeps.name, MSTPD_PORT_CONFIG, lineno);
+    }
+    fclose(f);
+}
 
 static bridge_t * create_br(int if_index)
 {
@@ -99,6 +230,7 @@ static port_t * create_if(bridge_t * br, int if_index)
         goto err;
     if(!MSTP_IN_port_create_and_add_tail(prt, portno))
         goto err;
+    apply_port_config(prt);
 
     return prt;
 err:
