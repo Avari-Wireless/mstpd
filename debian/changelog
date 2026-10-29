@@ -1,3 +1,16 @@
+mstpd (0.2.0+avari3) noble; urgency=medium
+
+  * bridge_track: apply per-port settings from /etc/mstpd-ports.conf when a
+    port is created, i.e. every time an interface joins a bridge. mstpd builds
+    each port from defaults on every (re)join, so settings made with mstpctl
+    were lost on a rejoin and raced the enslavement at boot (TEN-8786; the
+    same patch the unit images carry, meta-avari-bsp PR 623).
+  * debian: ship /etc/mstpd-ports.conf as a conffile with the DMC policy - no
+    per-port rules: Topology A lanbr0 members are ring links and stay full
+    RSTP; Topologies B and C run lanbr0 with STP off.
+
+ -- Steve Williams <swilliams@avariwireless.com>  Thu, 29 Oct 2026 04:00:00 +0000
+
 mstpd (0.2.0+avari2) noble; urgency=medium
 
   * debian: install and enable the mstpd systemd service. Upstream ships
